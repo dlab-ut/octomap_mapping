@@ -294,6 +294,7 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   }
   auto qos = latched_topics_ ? rclcpp::QoS{1}.transient_local() : rclcpp::QoS{1};
   marker_pub_ = create_publisher<MarkerArray>("occupied_cells_vis_array", qos);
+  marker_rectangle_pub_ = create_publisher<Marker>("valid_range", qos);
   binary_map_pub_ = create_publisher<Octomap>("octomap_binary", qos);
   full_map_pub_ = create_publisher<Octomap>("octomap_full", qos);
   point_cloud_pub_ = create_publisher<PointCloud2>("octomap_point_cloud_centers", qos);
@@ -403,12 +404,25 @@ void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
   PCLPointCloud pc;  // input cloud for filtering and ground-detection
   pcl::fromROSMsg(*cloud, pc);
 
+  geometry_msgs::msg::TransformStamped sensor_to_base_transform_stamped;
   geometry_msgs::msg::TransformStamped sensor_to_world_transform_stamped;
+  geometry_msgs::msg::TransformStamped base_to_world_transform_stamped;
   try {
+    tf2_buffer_->canTransform(
+        base_frame_id_, cloud->header.frame_id, cloud->header.stamp,
+        rclcpp::Duration::from_seconds(0.2));
+    sensor_to_base_transform_stamped = tf2_buffer_->lookupTransform(
+        base_frame_id_, cloud->header.frame_id, cloud->header.stamp,
+        rclcpp::Duration::from_seconds(1.0));
     sensor_to_world_transform_stamped = tf2_buffer_->lookupTransform(
-      world_frame_id_, cloud->header.frame_id, cloud->header.stamp,
-      rclcpp::Duration::from_seconds(1.0));
-  } catch (const tf2::TransformException & ex) {
+        world_frame_id_, cloud->header.frame_id, cloud->header.stamp,
+        rclcpp::Duration::from_seconds(1.0));
+    base_to_world_transform_stamped = tf2_buffer_->lookupTransform(
+        world_frame_id_, base_frame_id_, cloud->header.stamp,
+        rclcpp::Duration::from_seconds(1.0));
+  }
+  catch (const tf2::TransformException &ex)
+  {
     RCLCPP_WARN(this->get_logger(), "%s", ex.what());
     return;
   }
@@ -430,57 +444,26 @@ void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
   PCLPointCloud pc_ground;  // segmented ground plane
   PCLPointCloud pc_nonground;  // everything else
 
-  if (filter_ground_plane_) {
-    geometry_msgs::msg::TransformStamped sensor_to_base_transform_stamped;
-    geometry_msgs::msg::TransformStamped base_to_world_transform_stamped;
-    try {
-      tf2_buffer_->canTransform(
-        base_frame_id_, cloud->header.frame_id, cloud->header.stamp,
-        rclcpp::Duration::from_seconds(0.2));
-      sensor_to_base_transform_stamped = tf2_buffer_->lookupTransform(
-        base_frame_id_, cloud->header.frame_id, cloud->header.stamp,
-        rclcpp::Duration::from_seconds(1.0));
-      base_to_world_transform_stamped = tf2_buffer_->lookupTransform(
-        world_frame_id_, base_frame_id_, cloud->header.stamp,
-        rclcpp::Duration::from_seconds(1.0));
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_ERROR_STREAM(
-        get_logger(),
-        "Transform error for ground plane filter: " << ex.what() << ", quitting callback.\n"
-          "You need to set the base_frame_id or disable filter_ground.");
-    }
-
-
-    Eigen::Matrix4f sensor_to_base =
+  Eigen::Matrix4f sensor_to_base =
       tf2::transformToEigen(sensor_to_base_transform_stamped.transform).matrix().cast<float>();
-    Eigen::Matrix4f base_to_world =
+  Eigen::Matrix4f base_to_world =
       tf2::transformToEigen(base_to_world_transform_stamped.transform).matrix().cast<float>();
-
-    // transform pointcloud from sensor frame to fixed robot frame
-    pcl::transformPointCloud(pc, pc, sensor_to_base);
-    pass_x.setInputCloud(pc.makeShared());
-    pass_x.filter(pc);
-    pass_y.setInputCloud(pc.makeShared());
-    pass_y.filter(pc);
-    pass_z.setInputCloud(pc.makeShared());
-    pass_z.filter(pc);
+  // transform pointcloud from sensor frame to fixed robot frame
+  pcl::transformPointCloud(pc, pc, sensor_to_base);
+  pass_x.setInputCloud(pc.makeShared());
+  pass_x.filter(pc);
+  pass_y.setInputCloud(pc.makeShared());
+  pass_y.filter(pc);
+  pass_z.setInputCloud(pc.makeShared());
+  pass_z.filter(pc);
+  if (filter_ground_plane_) {
     filterGroundPlane(pc, pc_ground, pc_nonground);
-
+  
     // transform clouds to world frame for insertion
     pcl::transformPointCloud(pc_ground, pc_ground, base_to_world);
     pcl::transformPointCloud(pc_nonground, pc_nonground, base_to_world);
   } else {
-    // directly transform to map frame:
-    pcl::transformPointCloud(pc, pc, sensor_to_world);
-
-    // just filter height range:
-    pass_x.setInputCloud(pc.makeShared());
-    pass_x.filter(pc);
-    pass_y.setInputCloud(pc.makeShared());
-    pass_y.filter(pc);
-    pass_z.setInputCloud(pc.makeShared());
-    pass_z.filter(pc);
-
+    pcl::transformPointCloud(pc, pc, base_to_world);
     pc_nonground = pc;
     // pc_nonground is empty without ground segmentation
     pc_ground.header = pc.header;
@@ -497,6 +480,16 @@ void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
     "Pointcloud insertion in OctomapServer done (%zu+%zu pts (ground/nonground), %f sec)",
     pc_ground.size(), pc_nonground.size(), total_elapsed);
 
+  geometry_msgs::msg::Point::Ptr left_bottom(new geometry_msgs::msg::Point);
+  geometry_msgs::msg::Point::Ptr right_top(new geometry_msgs::msg::Point);
+  geometry_msgs::msg::Vector3 origin = base_to_world_transform_stamped.transform.translation;
+  left_bottom->x = origin.x + point_cloud_min_x_;
+  left_bottom->y = origin.y + point_cloud_min_y_;
+  right_top->x = origin.x + point_cloud_max_x_;
+  right_top->y = origin.y + point_cloud_max_y_;
+
+  clearOutsideBBox(left_bottom, right_top);
+  visualizeBBox(origin, point_cloud_min_x_, point_cloud_max_x_, point_cloud_min_y_, point_cloud_max_y_);
   publishAll(cloud->header.stamp);
 }
 

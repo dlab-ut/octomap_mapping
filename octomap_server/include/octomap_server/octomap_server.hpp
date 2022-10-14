@@ -47,6 +47,8 @@
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "std_msgs/msg/color_rgba.hpp"
 
+#include "geometry_msgs/msg/point.hpp"
+
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "std_srvs/srv/empty.hpp"
 
@@ -88,6 +90,7 @@ using octomap_msgs::msg::Octomap;
 using sensor_msgs::msg::PointCloud2;
 using std_msgs::msg::ColorRGBA;
 using visualization_msgs::msg::MarkerArray;
+using visualization_msgs::msg::Marker;
 
 class OctomapServer : public rclcpp::Node
 {
@@ -223,13 +226,17 @@ protected:
       (key[1] - padded_min_key_[1]) / multires_2d_scale_);
   }
 
+  void clearBBox(const geometry_msgs::msg::Point::Ptr &min_point, const geometry_msgs::msg::Point::Ptr &max_point);
+  void clearOutsideBBox(const geometry_msgs::msg::Point::ConstPtr &min, const geometry_msgs::msg::Point::ConstPtr &max);
+  void visualizeBBox(const geometry_msgs::msg::Vector3 &origin, const double min_x, const double max_x, const double min_y, const double max_y);
+
   /**
    * Adjust data of map due to a change in its info properties (origin or size,
    * resolution needs to stay fixed). map already contains the new map info,
    * but the data is stored according to old_map_info.
    */
 
-  void adjustMapData(OccupancyGrid & map, const MapMetaData & old_map_info) const;
+  void adjustMapData(OccupancyGrid &map, const MapMetaData &old_map_info) const;
 
   inline bool mapChanged(const MapMetaData & old_map_info, const MapMetaData & new_map_info)
   {
@@ -242,6 +249,7 @@ protected:
   static ColorRGBA heightMapColor(double h);
 
   rclcpp::Publisher<MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<Marker>::SharedPtr marker_rectangle_pub_;
   rclcpp::Publisher<Octomap>::SharedPtr binary_map_pub_;
   rclcpp::Publisher<Octomap>::SharedPtr full_map_pub_;
   rclcpp::Publisher<PointCloud2>::SharedPtr point_cloud_pub_;
